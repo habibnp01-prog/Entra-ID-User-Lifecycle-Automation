@@ -1,0 +1,17 @@
+Entra-ID-User-Lifecycle-Automation
+│
+├── README.md
+│
+├── Scripts
+│   ├── Get-ExpiredUsers.ps1
+│   ├── Disable-ExpiredUsers.ps1
+│   ├── Generate-UserExpiryReport.ps1
+│   └── Export-AuditLog.ps1
+│
+├── Documentation
+│   ├── Architecture.md
+│   ├── Setup.md
+│   └── Troubleshooting.md
+│
+└── Examples
+    └── Sample-Report.csv
