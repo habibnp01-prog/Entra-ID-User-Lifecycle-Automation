@@ -1,73 +1,59 @@
-﻿# ============================================
+# ============================================
 # Entra ID User Lifecycle Automation
 # Git Ignore Rules
 # ============================================
 
-# --------------------------------------------
 # Logs
-# --------------------------------------------
 Logs/*
-
-# Keep the directory in Git
 !Logs/.gitkeep
 
-
-# --------------------------------------------
 # Generated Reports
-# --------------------------------------------
 Reports/*
-
-# Keep the directory in Git
 !Reports/.gitkeep
 
-
-# --------------------------------------------
 # Environment-specific Configuration
-# --------------------------------------------
 Config/Config.json
+Config/*.local.json
+Config/*.secret.json
 
-
-# --------------------------------------------
-# Certificates
-# --------------------------------------------
+# Certificates and private keys
 *.pfx
 *.p12
+*.pem
+*.key
 *.cer
 *.crt
 
-
-# --------------------------------------------
-# Secrets and Keys
-# --------------------------------------------
+# Secrets and tokens
 *.secret
-*.key
-*.pem
 *.token
+*.credentials
+.env
+.env.*
 
+# PowerShell backup files
+*.ps1.bak
+*.ps1.orig
 
-# --------------------------------------------
-# Temporary Files
-# --------------------------------------------
+# Temporary files
 *.tmp
 *.temp
 *.bak
+~$*
 
-
-# --------------------------------------------
-# PowerShell Backup Files
-# --------------------------------------------
-*.ps1.bak
-
-
-# --------------------------------------------
-# Operating System Files
-# --------------------------------------------
+# Operating system files
 Thumbs.db
 .DS_Store
 
-
-# --------------------------------------------
-# Editor Files
-# --------------------------------------------
+# Editor files
+.vscode/
+.idea/
 *.swp
 *.swo
+
+# Test artifacts
+TestResults/
+coverage/
+
+# Local development files
+*.local.ps1
