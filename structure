@@ -3,15 +3,22 @@ Entra-ID-User-Lifecycle-Automation
 ├── README.md
 │
 ├── Scripts
-│   ├── Get-ExpiredUsers.ps1
-│   ├── Disable-ExpiredUsers.ps1
-│   ├── Generate-UserExpiryReport.ps1
-│   └── Export-AuditLog.ps1
+│   ├── 01-Set-UserExpiryDate.ps1
+│   ├── 02-Get-ExpiredUsers.ps1
+│   ├── 03-Disable-ExpiredUsers.ps1
+│   ├── 04-Write-AuditLog.ps1
+│   └── 05-Send-AdminNotification.ps1
 │
-├── Documentation
-│   ├── Architecture.md
-│   ├── Setup.md
-│   └── Troubleshooting.md
+├── Config
+│   └── Config.json
 │
-└── Examples
-    └── Sample-Report.csv
+├── Logs
+│   └── .gitkeep
+│
+├── Reports
+│   └── .gitkeep
+│
+└── Documentation
+    ├── Installation.md
+    ├── Permissions.md
+    └── Troubleshooting.md
