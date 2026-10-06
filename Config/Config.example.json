@@ -1,0 +1,41 @@
+{
+    "Project": {
+        "Name": "Entra ID User Lifecycle Automation",
+        "Version": "1.0.0"
+    },
+    "Administrator": {
+        "Email": "admin@contoso.com"
+    },
+    "MicrosoftGraph": {
+        "AuthenticationMode": "Interactive",
+        "Scopes": [
+            "User.Read.All",
+            "User.ReadWrite.All",
+            "Mail.Send"
+        ]
+    },
+    "Lifecycle": {
+        "ExpiryAttribute": "employeeLeaveDateTime",
+        "DisableExpiredUsers": true,
+        "SkipAlreadyDisabledUsers": true,
+        "UseWhatIfForTesting": true
+    },
+    "Schedule": {
+        "Enabled": false,
+        "Time": "00:05",
+        "Frequency": "Daily"
+    },
+    "Paths": {
+        "Logs": "Logs",
+        "Reports": "Reports"
+    },
+    "Notification": {
+        "Enabled": true,
+        "SendToAdministrator": true
+    },
+    "Security": {
+        "DoNotStoreSecretsInConfig": true,
+        "DoNotStoreAccessTokens": true,
+        "DoNotStoreCertificates": true
+    }
+}
