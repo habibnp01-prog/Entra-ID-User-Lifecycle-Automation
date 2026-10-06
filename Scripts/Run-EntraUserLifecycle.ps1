@@ -2,619 +2,773 @@
 
 <#
 .SYNOPSIS
-    Orchestrates the Microsoft Entra ID User Lifecycle Automation workflow.
+    Entra ID User Lifecycle Automation - Master Orchestrator
 
 .DESCRIPTION
-    This script coordinates the complete daily lifecycle workflow:
+    Complete lifecycle:
 
-        02 - Detect expired users
-        03 - Disable expired users
-        04 - Write audit events
-        05 - Send administrator notification
+        1. Detect expired users
+        2. Confirm and disable expired users
+        3. Confirm and remove directly assigned licenses
+        4. Write audit events
+        5. Send administrator notification
 
-    Script 01 is intentionally NOT called by this orchestrator.
-    User expiry dates are assigned manually or through another HR-driven
-    process using 01-Set-UserExpiryDate.ps1.
+    WHATIF:
+        - Detection is performed
+        - Detection report is created
+        - No Entra changes
+        - No licenses removed
+        - No audit events
+        - No email
 
-    Supports -WhatIf for safe end-to-end testing.
+    NORMAL:
+        - Separate confirmation for account disable
+        - Separate confirmation for license removal
 
-.PARAMETER AdminEmail
-    Administrator email address used by Script 05.
-
-.PARAMETER WhatIf
-    Runs the workflow in dry-run mode.
-
-    Script 02 runs normally because it is read-only.
-    Script 03 runs with -WhatIf.
-    Scripts 04 and 05 are NOT executed because no real lifecycle
-    action has taken place.
-
-.EXAMPLE
-    .\Run-EntraUserLifecycle.ps1 `
-        -AdminEmail "admin@contoso.com" `
-        -WhatIf
-
-.EXAMPLE
-    .\Run-EntraUserLifecycle.ps1 `
-        -AdminEmail "admin@contoso.com"
+    FORCE:
+        - Skips both confirmations
 
 .NOTES
-    Project:
-        Entra-ID-User-Lifecycle-Automation
-
-    PowerShell:
-        Windows PowerShell 5.1+
-
-    IMPORTANT:
-        The current implementation uses interactive Microsoft Graph
-        authentication.
-
-        For unattended Scheduled Task execution, this should later
-        be upgraded to Microsoft Graph application authentication
-        using an App Registration and certificate.
+    Script 03 results are read from its generated CSV report.
+    This avoids relying on console/pipeline output from child scripts.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding()]
 param(
-
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[^@\s]+@[^@\s]+\.[^@\s]+$')]
-    [string]$AdminEmail
+    [ValidateNotNullOrEmpty()]
+    [string]$AdminEmail,
+
+    [switch]$Force,
+
+    [switch]$WhatIf
 )
 
 # ============================================================
-# Project Paths
+# Configuration
 # ============================================================
 
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$ErrorActionPreference = "Stop"
 
-$Script02 = Join-Path `
-    $PSScriptRoot `
-    "02-Get-ExpiredUsers.ps1"
+$ScriptRoot  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = Split-Path -Parent $ScriptRoot
 
-$Script03 = Join-Path `
-    $PSScriptRoot `
-    "03-Disable-ExpiredUsers.ps1"
+$ReportsPath = Join-Path $ProjectRoot "Reports"
+$LogsPath    = Join-Path $ProjectRoot "Logs"
 
-$Script04 = Join-Path `
-    $PSScriptRoot `
-    "04-Write-AuditLog.ps1"
+$Script02 = Join-Path $ScriptRoot "02-Get-ExpiredUsers.ps1"
+$Script03 = Join-Path $ScriptRoot "03-Disable-ExpiredUsers.ps1"
+$Script04 = Join-Path $ScriptRoot "04-Remove-UserLicenses.ps1"
+$Script05 = Join-Path $ScriptRoot "05-Write-AuditLog.ps1"
+$Script06 = Join-Path $ScriptRoot "06-Send-AdminNotification.ps1"
 
-$Script05 = Join-Path `
-    $PSScriptRoot `
-    "05-Send-AdminNotification.ps1"
-
-$ReportsPath = Join-Path `
-    $ProjectRoot `
-    "Reports"
+$IsWhatIf = $WhatIf.IsPresent
 
 # ============================================================
 # Header
 # ============================================================
 
 Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host " Entra ID User Lifecycle Automation" `
-    -ForegroundColor Cyan
-
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host " Entra ID User Lifecycle Automation" -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host ""
 
-Write-Host "Project Root :" `
-    -ForegroundColor Gray
-
-Write-Host $ProjectRoot `
-    -ForegroundColor White
-
+Write-Host "Project Root :" -ForegroundColor Gray
+Write-Host $ProjectRoot -ForegroundColor White
 Write-Host ""
 
-Write-Host "Administrator :" `
-    -ForegroundColor Gray
-
-Write-Host $AdminEmail `
-    -ForegroundColor White
-
+Write-Host "Notification Administrator :" -ForegroundColor Gray
+Write-Host $AdminEmail -ForegroundColor White
 Write-Host ""
 
-# ============================================================
-# Execution Mode
-# ============================================================
+if ($IsWhatIf) {
 
-if ($WhatIfPreference) {
-
-    Write-Host "Execution Mode : DRY-RUN" `
-        -ForegroundColor Yellow
-
+    Write-Host "Execution Mode : WHATIF / DRY RUN" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "No user accounts will be modified." `
-        -ForegroundColor Yellow
-
-    Write-Host "No audit events will be created." `
-        -ForegroundColor Yellow
-
-    Write-Host "No email notifications will be sent." `
-        -ForegroundColor Yellow
+    Write-Host "WHATIF MODE ENABLED" -ForegroundColor Yellow
+    Write-Host "No user accounts will be modified." -ForegroundColor Yellow
+    Write-Host "No licenses will be removed." -ForegroundColor Yellow
+    Write-Host "No audit events will be written." -ForegroundColor Yellow
+    Write-Host "No notification email will be sent." -ForegroundColor Yellow
 }
 else {
 
-    Write-Host "Execution Mode : LIVE" `
-        -ForegroundColor Green
+    if ($Force) {
+        Write-Host "Execution Mode : FORCE" -ForegroundColor Red
+    }
+    else {
+        Write-Host "Execution Mode : NORMAL / CONFIRMATION REQUIRED" -ForegroundColor Green
+    }
+}
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+function Write-Section {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Title
+    )
 
     Write-Host ""
-    Write-Host "Expired enabled accounts may be disabled." `
-        -ForegroundColor Yellow
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host " $Title" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
 }
 
-# ============================================================
-# Validate Required Scripts
-# ============================================================
+function Test-ProjectScript {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
 
-Write-Host ""
-Write-Host "Validating project scripts..." `
-    -ForegroundColor Cyan
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
 
-$RequiredScripts = @(
-    $Script02,
-    $Script03,
-    $Script04,
-    $Script05
-)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
 
-foreach ($Script in $RequiredScripts) {
-
-    if (-not (Test-Path -Path $Script -PathType Leaf)) {
-
-        Write-Host ""
-        Write-Host "ERROR: Required script not found:" `
-            -ForegroundColor Red
-
-        Write-Host $Script `
-            -ForegroundColor Red
-
-        return
+        throw "Required script is missing: $Path"
     }
 
-    Write-Host "OK: $([System.IO.Path]::GetFileName($Script))" `
-        -ForegroundColor Green
+    Write-Host "OK: $Name" -ForegroundColor Green
 }
 
-# ============================================================
-# Validate Reports Directory
-# ============================================================
+function Get-LatestReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
 
-if (-not (Test-Path -Path $ReportsPath)) {
+        [Parameter(Mandatory = $true)]
+        [string]$Filter,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$StartedAt
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        return $null
+    }
+
+    $Files = Get-ChildItem `
+        -LiteralPath $Directory `
+        -Filter $Filter `
+        -File `
+        -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.LastWriteTime -ge $StartedAt.AddSeconds(-10)
+        } |
+        Sort-Object LastWriteTime -Descending
+
+    if ($Files) {
+        return $Files | Select-Object -First 1
+    }
+
+    return $null
+}
+
+function Get-GraphContextSafe {
 
     try {
 
-        New-Item `
-            -ItemType Directory `
-            -Path $ReportsPath `
-            -Force `
-            -ErrorAction Stop | Out-Null
+        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
+            return Get-MgContext -ErrorAction SilentlyContinue
+        }
+
+        return $null
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-AuditEventFromOrchestrator {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Action,
+
+        [string]$DisplayName,
+
+        [string]$UserPrincipalName,
+
+        [string]$EmployeeLeaveDate,
+
+        [string]$PreviousAccountStatus,
+
+        [string]$NewAccountStatus,
+
+        [string]$Result,
+
+        [string]$Details
+    )
+
+    if ($IsWhatIf) {
+
+        Write-Host ""
+        Write-Host "WHATIF: Audit event not written." -ForegroundColor Yellow
+
+        return [PSCustomObject]@{
+            Status  = "WhatIf"
+            EventId = $null
+        }
+    }
+
+    try {
+
+        $AuditResult = & $Script05 `
+            -Action $Action `
+            -DisplayName $DisplayName `
+            -UserPrincipalName $UserPrincipalName `
+            -EmployeeLeaveDate $EmployeeLeaveDate `
+            -PreviousAccountStatus $PreviousAccountStatus `
+            -NewAccountStatus $NewAccountStatus `
+            -Result $Result `
+            -Details $Details `
+            -ErrorAction Stop
+
+        if ($AuditResult -and $AuditResult.Status -eq "Success") {
+
+            return $AuditResult
+        }
+
+        throw "Audit script did not return a successful result."
     }
     catch {
 
         Write-Host ""
-        Write-Host "ERROR: Unable to create Reports directory." `
-            -ForegroundColor Red
+        Write-Host "WARNING: Audit event failed." -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
 
-        Write-Host $_.Exception.Message `
-            -ForegroundColor Red
-
-        return
+        return [PSCustomObject]@{
+            Status  = "Failed"
+            EventId = $null
+        }
     }
 }
 
 # ============================================================
-# Capture Existing Disable Reports
+# STEP 0 - Validate Scripts
 # ============================================================
 
-$ExistingDisableReports = @()
+Write-Section "Validating Project Scripts"
 
-$ExistingDisableReports = @(
-    Get-ChildItem `
-        -Path $ReportsPath `
-        -Filter "DisableExpiredUsers_*.csv" `
-        -File `
-        -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty FullName
-)
+Test-ProjectScript `
+    -Path $Script02 `
+    -Name "02-Get-ExpiredUsers.ps1"
+
+Test-ProjectScript `
+    -Path $Script03 `
+    -Name "03-Disable-ExpiredUsers.ps1"
+
+Test-ProjectScript `
+    -Path $Script04 `
+    -Name "04-Remove-UserLicenses.ps1"
+
+Test-ProjectScript `
+    -Path $Script05 `
+    -Name "05-Write-AuditLog.ps1"
+
+Test-ProjectScript `
+    -Path $Script06 `
+    -Name "06-Send-AdminNotification.ps1"
 
 # ============================================================
-# STEP 1
-# Detect Expired Users
+# STEP 1 - Detect Expired Users
 # ============================================================
 
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+Write-Section "STEP 1 - Detect Expired Users"
 
-Write-Host " STEP 1 - Detect Expired Users" `
-    -ForegroundColor Cyan
-
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host ""
+$DetectionStartedAt = Get-Date
 
 try {
 
-    & $Script02
+    # Script 02 is read-only.
+    # Do not pass -WhatIf to it.
 
-    if ($LASTEXITCODE -ne 0) {
+    & $Script02 `
+        -ErrorAction Stop | Out-Host
 
-        Write-Host ""
-        Write-Host "ERROR: Script 02 failed." `
-            -ForegroundColor Red
-
-        return
-    }
+    Write-Host ""
+    Write-Host "Script 02 completed successfully." -ForegroundColor Green
 }
 catch {
 
-    Write-Host ""
-    Write-Host "ERROR: Script 02 execution failed." `
-        -ForegroundColor Red
+    throw "Expired user detection failed: $($_.Exception.Message)"
+}
 
-    Write-Host $_.Exception.Message `
-        -ForegroundColor Red
+# ============================================================
+# Locate Detection Report
+# ============================================================
+
+$ExpiredReport = Get-LatestReport `
+    -Directory $ReportsPath `
+    -Filter "ExpiredUsers_*.csv" `
+    -StartedAt $DetectionStartedAt
+
+if (-not $ExpiredReport) {
+
+    throw "Unable to locate the expired-user detection report."
+}
+
+Write-Host ""
+Write-Host "Detection report:" -ForegroundColor Gray
+Write-Host $ExpiredReport.FullName -ForegroundColor White
+
+# ============================================================
+# Read Detection Report
+# ============================================================
+
+$ExpiredUsers = @(
+    Import-Csv `
+        -LiteralPath $ExpiredReport.FullName `
+        -ErrorAction Stop |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.UserPrincipalName)
+        }
+)
+
+$ExpiredEnabledUsers = @(
+    $ExpiredUsers | Where-Object {
+        "$($_.AccountEnabled)" -eq "True" -and
+        "$($_.ActionRequired)" -eq "Disable Account"
+    }
+)
+
+$ExpiredAlreadyDisabledUsers = @(
+    $ExpiredUsers | Where-Object {
+        "$($_.AccountEnabled)" -eq "False"
+    }
+)
+
+Write-Host ""
+Write-Host "Expired users in report : $($ExpiredUsers.Count)" -ForegroundColor Yellow
+Write-Host "Expired + Enabled       : $($ExpiredEnabledUsers.Count)" -ForegroundColor Yellow
+Write-Host "Already Disabled        : $($ExpiredAlreadyDisabledUsers.Count)" -ForegroundColor Gray
+
+# ============================================================
+# Graph Context
+# ============================================================
+
+$GraphContext = Get-GraphContextSafe
+
+if ($GraphContext) {
+
+    Write-Host ""
+    Write-Host "Microsoft 365 Administrator :" -ForegroundColor Gray
+    Write-Host $GraphContext.Account -ForegroundColor White
+
+    Write-Host ""
+    Write-Host "Tenant ID :" -ForegroundColor Gray
+    Write-Host $GraphContext.TenantId -ForegroundColor White
+}
+
+# ============================================================
+# No Users
+# ============================================================
+
+if ($ExpiredEnabledUsers.Count -eq 0) {
+
+    Write-Host ""
+    Write-Host "No expired and enabled users require disabling." -ForegroundColor Green
+
+    if ($IsWhatIf) {
+        Write-Host ""
+        Write-Host "WHATIF completed successfully." -ForegroundColor Green
+    }
+    else {
+        Write-Host ""
+        Write-Host "Lifecycle completed. No changes were required." -ForegroundColor Green
+    }
 
     return
 }
 
 # ============================================================
-# STEP 2
-# Disable Expired Users
+# Display Users
 # ============================================================
 
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+Write-Section "Users Requiring Action"
 
-Write-Host " STEP 2 - Disable Expired Users" `
-    -ForegroundColor Cyan
+$ExpiredEnabledUsers |
+    Select-Object `
+        DisplayName,
+        UserPrincipalName,
+        EmployeeLeaveDate,
+        DaysExpired,
+        ActionRequired |
+    Format-Table -AutoSize
 
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+# ============================================================
+# WHATIF
+# ============================================================
 
-Write-Host ""
+if ($IsWhatIf) {
 
-try {
+    Write-Section "WHATIF - Disable Preview"
 
-    if ($WhatIfPreference) {
+    Write-Host "The following accounts WOULD be disabled:" -ForegroundColor Yellow
+    Write-Host ""
 
-        & $Script03 -Force -WhatIf
+    $ExpiredEnabledUsers |
+        Select-Object `
+            DisplayName,
+            UserPrincipalName,
+            EmployeeLeaveDate,
+            DaysExpired |
+        Format-Table -AutoSize
+
+    Write-Host ""
+    Write-Host "WHATIF SUMMARY" -ForegroundColor Cyan
+    Write-Host "---------------" -ForegroundColor Cyan
+    Write-Host "Accounts that would be disabled : $($ExpiredEnabledUsers.Count)" -ForegroundColor Yellow
+    Write-Host "Licenses that would be removed  : Not executed" -ForegroundColor Yellow
+    Write-Host "Audit events written            : 0" -ForegroundColor Yellow
+    Write-Host "Notification email sent         : No" -ForegroundColor Yellow
+    Write-Host ""
+
+    Write-Host "WHATIF completed successfully." -ForegroundColor Green
+
+    return
+}
+
+# ============================================================
+# STEP 2 - Disable Confirmation
+# ============================================================
+
+Write-Section "STEP 2 - Disable Expired Users"
+
+$DisableApproved = $false
+
+if ($Force) {
+
+    Write-Host "FORCE mode enabled." -ForegroundColor Red
+    Write-Host "Disable confirmation skipped." -ForegroundColor Yellow
+
+    $DisableApproved = $true
+}
+else {
+
+    Write-Host "The following accounts are expired and enabled:" -ForegroundColor Yellow
+    Write-Host ""
+
+    $ExpiredEnabledUsers |
+        Select-Object `
+            DisplayName,
+            UserPrincipalName,
+            EmployeeLeaveDate,
+            DaysExpired |
+        Format-Table -AutoSize
+
+    Write-Host ""
+
+    $DisableConfirmation = Read-Host `
+        "Disable expired user accounts? (Y/N)"
+
+    if ($DisableConfirmation -match "^(Y|YES)$") {
+
+        $DisableApproved = $true
     }
     else {
 
-        & $Script03 -Force
+        Write-Host ""
+        Write-Host "Disable operation cancelled by administrator." -ForegroundColor Yellow
     }
+}
 
-    if ($LASTEXITCODE -ne 0) {
+# ============================================================
+# STEP 2A - Execute Disable
+# ============================================================
+
+$DisableResultReport = $null
+$DisableReport = $null
+
+if ($DisableApproved) {
+
+    $DisableStartedAt = Get-Date
+
+    try {
+
+        # Script 03 creates the authoritative CSV report.
+        # Do not depend on child-script pipeline output.
+
+        & $Script03 `
+            -Force `
+            -ErrorAction Stop | Out-Host
 
         Write-Host ""
-        Write-Host "ERROR: Script 03 failed." `
-            -ForegroundColor Red
-
-        return
+        Write-Host "Script 03 completed successfully." -ForegroundColor Green
     }
-}
-catch {
+    catch {
 
-    Write-Host ""
-    Write-Host "ERROR: Script 03 execution failed." `
-        -ForegroundColor Red
+        throw "Disable operation failed: $($_.Exception.Message)"
+    }
 
-    Write-Host $_.Exception.Message `
-        -ForegroundColor Red
+    # --------------------------------------------------------
+    # Locate Disable Report
+    # --------------------------------------------------------
 
-    return
-}
-
-# ============================================================
-# DRY-RUN STOP
-# ============================================================
-
-if ($WhatIfPreference) {
-
-    Write-Host ""
-    Write-Host "=============================================" `
-        -ForegroundColor Yellow
-
-    Write-Host " DRY-RUN COMPLETE" `
-        -ForegroundColor Yellow
-
-    Write-Host "=============================================" `
-        -ForegroundColor Yellow
-
-    Write-Host ""
-
-    Write-Host "Workflow tested:" `
-        -ForegroundColor Cyan
-
-    Write-Host "  02 - Detect expired users" `
-        -ForegroundColor Gray
-
-    Write-Host "  03 - Evaluate disable actions" `
-        -ForegroundColor Gray
-
-    Write-Host ""
-
-    Write-Host "Skipped intentionally:" `
-        -ForegroundColor Cyan
-
-    Write-Host "  04 - Write audit events" `
-        -ForegroundColor Gray
-
-    Write-Host "  05 - Send administrator notification" `
-        -ForegroundColor Gray
-
-    Write-Host ""
-
-    Write-Host "No user accounts were modified." `
-        -ForegroundColor Green
-
-    Write-Host "No email was sent." `
-        -ForegroundColor Green
-
-    return
-}
-
-# ============================================================
-# STEP 3
-# Find Newly Generated Disable Report
-# ============================================================
-
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host " STEP 3 - Process Disable Results" `
-    -ForegroundColor Cyan
-
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host ""
-
-$CurrentDisableReports = @(
-    Get-ChildItem `
-        -Path $ReportsPath `
+    $DisableReport = Get-LatestReport `
+        -Directory $ReportsPath `
         -Filter "DisableExpiredUsers_*.csv" `
-        -File `
-        -ErrorAction SilentlyContinue
-)
+        -StartedAt $DisableStartedAt
 
-$NewDisableReports = @(
-    $CurrentDisableReports |
-    Where-Object {
-        $_.FullName -notin $ExistingDisableReports
-    } |
-    Sort-Object LastWriteTime -Descending
-)
+    if (-not $DisableReport) {
 
-if ($NewDisableReports.Count -eq 0) {
-
-    Write-Host "No new disable report was generated." `
-        -ForegroundColor Green
+        throw "Unable to locate the disable operation report."
+    }
 
     Write-Host ""
-    Write-Host "This normally means there were no expired" `
-        -ForegroundColor Gray
+    Write-Host "Disable operation report:" -ForegroundColor Gray
+    Write-Host $DisableReport.FullName -ForegroundColor White
 
-    Write-Host "enabled accounts requiring action." `
-        -ForegroundColor Gray
+    # --------------------------------------------------------
+    # Read Disable Report
+    # --------------------------------------------------------
 
-    Write-Host ""
-
-    Write-Host "Skipping audit and notification." `
-        -ForegroundColor Green
-
-    Write-Host ""
-    Write-Host "Lifecycle workflow completed." `
-        -ForegroundColor Green
-
-    return
-}
-
-$LatestDisableReport = $NewDisableReports |
-    Select-Object -First 1
-
-Write-Host "New disable report found:" `
-    -ForegroundColor Green
-
-Write-Host $LatestDisableReport.FullName `
-    -ForegroundColor Gray
-
-# ============================================================
-# Import Disable Results
-# ============================================================
-
-try {
-
-    $DisableResults = @(
+    $DisableResultReport = @(
         Import-Csv `
-            -Path $LatestDisableReport.FullName `
+            -LiteralPath $DisableReport.FullName `
             -ErrorAction Stop
     )
-}
-catch {
+
+    # Only successful results are eligible for next stage.
+
+    $SuccessfulDisables = @(
+        $DisableResultReport | Where-Object {
+            "$($_.Result)" -eq "Success"
+        }
+    )
+
+    $FailedDisables = @(
+        $DisableResultReport | Where-Object {
+            "$($_.Result)" -eq "Failed"
+        }
+    )
 
     Write-Host ""
-    Write-Host "ERROR: Unable to read disable report." `
-        -ForegroundColor Red
+    Write-Host "Successfully disabled : $($SuccessfulDisables.Count)" -ForegroundColor Green
+    Write-Host "Failed                : $($FailedDisables.Count)" -ForegroundColor $(if ($FailedDisables.Count -gt 0) { "Red" } else { "Green" })
+}
+else {
 
-    Write-Host $_.Exception.Message `
-        -ForegroundColor Red
-
-    return
+    $SuccessfulDisables = @()
+    $FailedDisables = @()
 }
 
-Write-Host ""
-Write-Host "Disable result entries: $($DisableResults.Count)" `
-    -ForegroundColor Cyan
-
 # ============================================================
-# STEP 4
-# Write Audit Events
+# STEP 2B - Audit Disable Results
 # ============================================================
-
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host " STEP 4 - Write Audit Events" `
-    -ForegroundColor Cyan
-
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host ""
 
 $AuditSuccessCount = 0
 $AuditFailureCount = 0
 
-foreach ($Result in $DisableResults) {
+if ($DisableResultReport.Count -gt 0) {
 
-    # --------------------------------------------------------
-    # Determine Audit Values
-    # --------------------------------------------------------
+    Write-Section "Audit - Disable Results"
 
-    $AuditAction = "Disable"
-    $AuditResult = "Success"
-    $NewStatus = "Disabled"
+    foreach ($Result in $DisableResultReport) {
 
-    if ($Result.Result -eq "WhatIf - No Change") {
+        if ([string]::IsNullOrWhiteSpace($Result.UserPrincipalName)) {
+            continue
+        }
 
-        $AuditAction = "Skip"
-        $AuditResult = "Skipped"
-        $NewStatus = $Result.PreviousStatus
-    }
-    elseif ($Result.Result -ne "Success") {
-
-        $AuditAction = "Failure"
-        $AuditResult = "Failed"
-        $NewStatus = $Result.PreviousStatus
-    }
-
-    try {
-
-        & $Script04 `
-            -Action $AuditAction `
+        $AuditResult = Write-AuditEventFromOrchestrator `
+            -Action "Disable" `
             -DisplayName $Result.DisplayName `
             -UserPrincipalName $Result.UserPrincipalName `
             -EmployeeLeaveDate $Result.EmployeeLeaveDate `
-            -PreviousAccountStatus $Result.PreviousStatus `
-            -NewAccountStatus $NewStatus `
-            -Result $AuditResult `
-            -Details $Result.Result
+            -PreviousAccountStatus $Result.PreviousAccountStatus `
+            -NewAccountStatus $Result.NewAccountStatus `
+            -Result $Result.Result `
+            -Details $Result.Details
 
-        if ($LASTEXITCODE -eq 0) {
+        if ($AuditResult.Status -eq "Success") {
 
             $AuditSuccessCount++
         }
-        else {
+        elseif ($AuditResult.Status -eq "Failed") {
 
             $AuditFailureCount++
         }
     }
-    catch {
+}
 
-        $AuditFailureCount++
+# ============================================================
+# STEP 3 - License Removal
+# ============================================================
+
+Write-Section "STEP 3 - Remove Directly Assigned Licenses"
+
+if ($SuccessfulDisables.Count -eq 0) {
+
+    Write-Host "No successfully disabled users are available for license removal." -ForegroundColor Gray
+}
+else {
+
+    Write-Host "Successfully disabled users:" -ForegroundColor Green
+    Write-Host ""
+
+    $SuccessfulDisables |
+        Select-Object `
+            DisplayName,
+            UserPrincipalName |
+        Format-Table -AutoSize
+
+    $LicenseApproved = $false
+
+    if ($Force) {
 
         Write-Host ""
-        Write-Host "ERROR: Audit event failed for:" `
-            -ForegroundColor Red
+        Write-Host "FORCE mode enabled." -ForegroundColor Red
+        Write-Host "License removal confirmation skipped." -ForegroundColor Yellow
 
-        Write-Host $Result.UserPrincipalName `
-            -ForegroundColor Red
+        $LicenseApproved = $true
+    }
+    else {
 
-        Write-Host $_.Exception.Message `
-            -ForegroundColor Red
+        Write-Host ""
+
+        $LicenseConfirmation = Read-Host `
+            "Remove directly assigned licenses? (Y/N)"
+
+        if ($LicenseConfirmation -match "^(Y|YES)$") {
+
+            $LicenseApproved = $true
+        }
+        else {
+
+            Write-Host ""
+            Write-Host "License removal cancelled by administrator." -ForegroundColor Yellow
+        }
+    }
+
+    # --------------------------------------------------------
+    # Execute License Removal
+    # --------------------------------------------------------
+
+    if ($LicenseApproved) {
+
+        foreach ($DisabledUser in $SuccessfulDisables) {
+
+            try {
+
+                Write-Host ""
+                Write-Host "Removing licenses from:" -ForegroundColor Cyan
+                Write-Host $DisabledUser.UserPrincipalName -ForegroundColor White
+
+                & $Script04 `
+                    -UserPrincipalName $DisabledUser.UserPrincipalName `
+                    -Force `
+                    -ErrorAction Stop | Out-Host
+
+                Write-Host ""
+                Write-Host "License operation completed." -ForegroundColor Green
+
+                $LicenseDetails = "Directly assigned licenses removed."
+
+                $AuditResult = Write-AuditEventFromOrchestrator `
+                    -Action "RemoveLicense" `
+                    -DisplayName $DisabledUser.DisplayName `
+                    -UserPrincipalName $DisabledUser.UserPrincipalName `
+                    -EmployeeLeaveDate $DisabledUser.EmployeeLeaveDate `
+                    -PreviousAccountStatus "Disabled" `
+                    -NewAccountStatus "Disabled" `
+                    -Result "Success" `
+                    -Details $LicenseDetails
+
+                if ($AuditResult.Status -eq "Success") {
+
+                    $AuditSuccessCount++
+                }
+                elseif ($AuditResult.Status -eq "Failed") {
+
+                    $AuditFailureCount++
+                }
+            }
+            catch {
+
+                Write-Host ""
+                Write-Host "License removal failed." -ForegroundColor Red
+                Write-Host $_.Exception.Message -ForegroundColor Red
+
+                $AuditResult = Write-AuditEventFromOrchestrator `
+                    -Action "RemoveLicense" `
+                    -DisplayName $DisabledUser.DisplayName `
+                    -UserPrincipalName $DisabledUser.UserPrincipalName `
+                    -EmployeeLeaveDate $DisabledUser.EmployeeLeaveDate `
+                    -PreviousAccountStatus "Disabled" `
+                    -NewAccountStatus "Disabled" `
+                    -Result "Failed" `
+                    -Details $_.Exception.Message
+
+                if ($AuditResult.Status -eq "Success") {
+
+                    $AuditSuccessCount++
+                }
+                elseif ($AuditResult.Status -eq "Failed") {
+
+                    $AuditFailureCount++
+                }
+            }
+        }
     }
 }
 
-Write-Host ""
-Write-Host "Audit events written : $AuditSuccessCount" `
-    -ForegroundColor Green
-
-Write-Host "Audit events failed  : $AuditFailureCount" `
-    -ForegroundColor Yellow
-
 # ============================================================
-# STEP 5
-# Send Administrator Notification
+# STEP 4 - Audit Summary
 # ============================================================
 
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+Write-Section "STEP 4 - Audit"
 
-Write-Host " STEP 5 - Send Administrator Notification" `
-    -ForegroundColor Cyan
+Write-Host "Audit events successfully written : $AuditSuccessCount" -ForegroundColor Green
+Write-Host "Audit events failed               : $AuditFailureCount" -ForegroundColor $(if ($AuditFailureCount -gt 0) { "Red" } else { "Green" })
 
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+# ============================================================
+# STEP 5 - Notification
+# ============================================================
 
-Write-Host ""
+Write-Section "STEP 5 - Administrator Notification"
 
 try {
 
-    & $Script05 `
-        -AdminEmail $AdminEmail
+    & $Script06 `
+        -AdminEmail $AdminEmail `
+        -IncludeAllSuccessfulActions `
+        -ErrorAction Stop | Out-Host
 
-    if ($LASTEXITCODE -ne 0) {
-
-        Write-Host ""
-        Write-Host "WARNING: Notification script returned an error." `
-            -ForegroundColor Yellow
-    }
+    Write-Host ""
+    Write-Host "Administrator notification completed successfully." -ForegroundColor Green
 }
 catch {
 
     Write-Host ""
-    Write-Host "WARNING: Notification failed." `
-        -ForegroundColor Yellow
-
-    Write-Host $_.Exception.Message `
-        -ForegroundColor Yellow
+    Write-Host "WARNING: Administrator notification failed." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
 }
 
 # ============================================================
-# Final Summary
+# FINAL SUMMARY
 # ============================================================
 
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+Write-Section "FINAL SUMMARY"
 
-Write-Host " Lifecycle Automation Summary" `
-    -ForegroundColor Cyan
+Write-Host "Detection report                 : $($ExpiredReport.Name)" -ForegroundColor White
+Write-Host "Expired users                    : $($ExpiredUsers.Count)" -ForegroundColor Yellow
+Write-Host "Expired + Enabled                : $($ExpiredEnabledUsers.Count)" -ForegroundColor Yellow
+Write-Host "Already disabled                 : $($ExpiredAlreadyDisabledUsers.Count)" -ForegroundColor Gray
 
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-
-Write-Host ""
-
-Write-Host "Execution Mode       : LIVE"
-Write-Host "Disable Report       : $($LatestDisableReport.Name)"
-Write-Host "Disable Results      : $($DisableResults.Count)"
-Write-Host "Audit Events Written : $AuditSuccessCount"
-Write-Host "Audit Events Failed  : $AuditFailureCount"
+$SuccessfulDisableCount = $SuccessfulDisables.Count
 
 Write-Host ""
+Write-Host "Execution mode                  : LIVE" -ForegroundColor Green
+Write-Host "Users successfully disabled     : $SuccessfulDisableCount" -ForegroundColor Green
+Write-Host "Audit events written            : $AuditSuccessCount" -ForegroundColor Green
+Write-Host "Audit events failed             : $AuditFailureCount" -ForegroundColor $(if ($AuditFailureCount -gt 0) { "Red" } else { "Green" })
+Write-Host "Notification attempted          : Yes" -ForegroundColor Green
 
-if ($AuditFailureCount -gt 0) {
-
-    Write-Host "WARNING: One or more audit events failed." `
-        -ForegroundColor Yellow
-}
-
-Write-Host "Lifecycle workflow completed." `
-    -ForegroundColor Green
-
+Write-Host ""
+Write-Host "Lifecycle execution completed." -ForegroundColor Green
 Write-Host ""

@@ -2,307 +2,300 @@
 
 <#
 .SYNOPSIS
-    Detects Microsoft Entra ID users whose employee leave date has passed.
+    Detects Microsoft Entra ID users whose employee leave date has expired.
 
 .DESCRIPTION
-    This script connects to Microsoft Graph using read-only permissions,
-    retrieves Entra ID users with employeeLeaveDateTime configured,
-    identifies expired users, and exports the results to a CSV report.
+    Retrieves Microsoft Entra ID users with an EmployeeLeaveDateTime value
+    and identifies users whose leave date is before today's date.
 
-    IMPORTANT:
-    This script does NOT disable or modify any user accounts.
+    This script is READ-ONLY against Microsoft Entra ID.
+
+    It does NOT:
+        - Disable users
+        - Remove licenses
+        - Modify users
+        - Send emails
+        - Write audit events
+
+    It DOES:
+        - Read users from Microsoft Entra ID
+        - Identify expired users
+        - Display results
+        - Export an expired-user report
 
 .NOTES
-    Project: Entra-ID-User-Lifecycle-Automation
-    Script: 02-Get-ExpiredUsers.ps1
-    PowerShell: Windows PowerShell 5.1+
+    Required Microsoft Graph Permission:
+        User.Read.All
+
+    Required Modules:
+        Microsoft.Graph.Authentication
+        Microsoft.Graph.Users
 #>
 
 [CmdletBinding()]
 param()
 
-# ------------------------------------------------------------
+# ============================================================
 # Configuration
-# ------------------------------------------------------------
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = Split-Path -Parent $ScriptRoot
+
+$ReportsPath = Join-Path $ProjectRoot "Reports"
+
+$GraphScopes = @(
+    "User.Read.All"
+)
 
 $RequiredModules = @(
     "Microsoft.Graph.Authentication",
     "Microsoft.Graph.Users"
 )
 
-$GraphScopes = @(
-    "User.Read.All"
-)
+# ============================================================
+# Helper Functions
+# ============================================================
 
-# ------------------------------------------------------------
-# Project Paths
-# ------------------------------------------------------------
-
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
-$ReportsPath = Join-Path $ProjectRoot "Reports"
-
-if (-not (Test-Path -Path $ReportsPath)) {
-    New-Item -ItemType Directory -Path $ReportsPath -Force | Out-Null
-}
-
-$ReportFile = Join-Path $ReportsPath (
-    "ExpiredUsers_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
-)
-
-# ------------------------------------------------------------
-# Helper Function - Load Required Module
-# ------------------------------------------------------------
-
-function Import-RequiredModule {
-    param (
+function Write-Section {
+    param(
         [Parameter(Mandatory = $true)]
-        [string]$ModuleName
+        [string]$Title
     )
 
-    try {
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host " $Title" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+}
 
-        # Check installed modules first.
-        # This method is intentionally used because Windows PowerShell
-        # may not always discover Microsoft Graph modules through
-        # Get-Module -ListAvailable.
+function Test-RequiredModules {
 
-        $InstalledModule = Get-InstalledModule `
-            -Name $ModuleName `
-            -ErrorAction SilentlyContinue
+    foreach ($ModuleName in $RequiredModules) {
 
-        if ($InstalledModule) {
-
-            Import-Module `
-                -Name $ModuleName `
-                -ErrorAction Stop
-
-            Write-Host "Loaded module: $ModuleName" -ForegroundColor Green
-            return
-        }
-
-        # Check whether the module is already loaded.
         $LoadedModule = Get-Module -Name $ModuleName
 
         if ($LoadedModule) {
-
-            Write-Host "Module already loaded: $ModuleName" `
-                -ForegroundColor Green
-
-            return
+            Write-Host "Loaded module: $ModuleName" -ForegroundColor Green
+            continue
         }
 
-        throw "Required module '$ModuleName' is not installed."
+        $AvailableModule = Get-Module -ListAvailable -Name $ModuleName |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
 
-    }
-    catch {
-        Write-Error "Failed to load module '$ModuleName'. $($_.Exception.Message)"
-        throw
-    }
-}
+        if (-not $AvailableModule) {
 
-# ------------------------------------------------------------
-# Load Microsoft Graph Modules
-# ------------------------------------------------------------
+            Write-Host ""
+            Write-Host "ERROR: Required module '$ModuleName' is not installed." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Install it using:" -ForegroundColor Yellow
+            Write-Host "Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber" -ForegroundColor White
+            Write-Host ""
 
-Write-Host ""
-Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host " Microsoft Entra ID - Expired User Detection" -ForegroundColor Cyan
-Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host ""
+            throw "Required module '$ModuleName' is missing."
+        }
 
-foreach ($Module in $RequiredModules) {
+        Import-Module $AvailableModule.Path -ErrorAction Stop
 
-    Import-RequiredModule -ModuleName $Module
-}
-
-# ------------------------------------------------------------
-# Verify Required Graph Commands
-# ------------------------------------------------------------
-
-$RequiredCommands = @(
-    "Connect-MgGraph",
-    "Get-MgContext",
-    "Get-MgUser"
-)
-
-foreach ($Command in $RequiredCommands) {
-
-    if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
-
-        throw "Required Microsoft Graph command '$Command' is not available."
+        Write-Host "Loaded module: $ModuleName" -ForegroundColor Green
     }
 }
 
-Write-Host ""
-Write-Host "Required Microsoft Graph commands verified." `
-    -ForegroundColor Green
+function Test-RequiredGraphCommands {
 
-# ------------------------------------------------------------
+    $RequiredCommands = @(
+        "Connect-MgGraph",
+        "Get-MgContext",
+        "Get-MgUser"
+    )
+
+    foreach ($CommandName in $RequiredCommands) {
+
+        $Command = Get-Command $CommandName -ErrorAction SilentlyContinue
+
+        if (-not $Command) {
+            throw "Required Microsoft Graph command '$CommandName' was not found."
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Required Microsoft Graph commands verified." -ForegroundColor Green
+}
+
+function Connect-ToGraph {
+
+    Write-Host ""
+    Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Yellow
+    Write-Host "Required permission: User.Read.All" -ForegroundColor Gray
+    Write-Host ""
+
+    $Context = Get-MgContext -ErrorAction SilentlyContinue
+
+    $NeedsConnection = $true
+
+    if ($Context) {
+
+        $ExistingScopes = @($Context.Scopes)
+
+        if ($ExistingScopes -contains "User.Read.All") {
+
+            Write-Host "Existing Microsoft Graph session found." -ForegroundColor Green
+            Write-Host "Using existing session." -ForegroundColor Green
+
+            $NeedsConnection = $false
+        }
+    }
+
+    if ($NeedsConnection) {
+
+        Connect-MgGraph `
+            -Scopes $GraphScopes `
+            -NoWelcome `
+            -ErrorAction Stop
+    }
+
+    $Context = Get-MgContext -ErrorAction Stop
+
+    if (-not $Context) {
+        throw "Microsoft Graph connection could not be established."
+    }
+
+    Write-Host "Connected successfully." -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "Account : $($Context.Account)" -ForegroundColor White
+    Write-Host "Tenant  : $($Context.TenantId)" -ForegroundColor White
+    Write-Host "Scopes  : $($Context.Scopes -join ', ')" -ForegroundColor DarkGray
+}
+
+# ============================================================
+# Start
+# ============================================================
+
+Write-Section "Microsoft Entra ID - Expired User Detection"
+
+# ============================================================
+# Validate Modules
+# ============================================================
+
+Test-RequiredModules
+
+Test-RequiredGraphCommands
+
+# ============================================================
 # Connect to Microsoft Graph
-# ------------------------------------------------------------
+# ============================================================
 
-Write-Host ""
-Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Yellow
-Write-Host "Required permission: User.Read.All" -ForegroundColor DarkGray
-Write-Host ""
+Connect-ToGraph
 
-try {
+# ============================================================
+# Prepare Reports Directory
+# ============================================================
 
-    Connect-MgGraph `
-        -Scopes $GraphScopes `
-        -NoWelcome `
-        -ErrorAction Stop
+if (-not (Test-Path -Path $ReportsPath)) {
 
-}
-catch {
-
-    Write-Error "Microsoft Graph connection failed: $($_.Exception.Message)"
-    exit 1
+    New-Item `
+        -Path $ReportsPath `
+        -ItemType Directory `
+        -Force `
+        -ErrorAction Stop | Out-Null
 }
 
-# ------------------------------------------------------------
-# Display Graph Context
-# ------------------------------------------------------------
-
-$Context = Get-MgContext
-
-if (-not $Context) {
-
-    Write-Error "Unable to retrieve Microsoft Graph context."
-    exit 1
-}
-
-Write-Host "Connected successfully." -ForegroundColor Green
-Write-Host ""
-Write-Host "Account : $($Context.Account)" -ForegroundColor Gray
-Write-Host "Tenant  : $($Context.TenantId)" -ForegroundColor Gray
-Write-Host "Scopes  : $($Context.Scopes -join ', ')" -ForegroundColor Gray
-
-# ------------------------------------------------------------
-# Determine Current Date
-# ------------------------------------------------------------
+# ============================================================
+# Today's Date
+# ============================================================
 
 $Today = (Get-Date).Date
 
 Write-Host ""
-Write-Host "Today's Date: $($Today.ToString('yyyy-MM-dd'))" `
-    -ForegroundColor Cyan
+Write-Host "Today's Date: $($Today.ToString('yyyy-MM-dd'))" -ForegroundColor White
 
-# ------------------------------------------------------------
-# Retrieve Entra ID Users
-# ------------------------------------------------------------
+# ============================================================
+# Retrieve Users
+# ============================================================
 
 Write-Host ""
-Write-Host "Retrieving users from Microsoft Entra ID..." `
-    -ForegroundColor Yellow
+Write-Host "Retrieving users from Microsoft Entra ID..." -ForegroundColor Yellow
 
-try {
+$Users = Get-MgUser `
+    -All `
+    -Property Id,DisplayName,UserPrincipalName,AccountEnabled,EmployeeLeaveDateTime `
+    -ErrorAction Stop
 
-    $Users = Get-MgUser `
-        -All `
-        -Property Id,DisplayName,UserPrincipalName,AccountEnabled,EmployeeLeaveDateTime `
-        -ErrorAction Stop
+Write-Host "Total users retrieved: $($Users.Count)" -ForegroundColor Green
 
-}
-catch {
+# ============================================================
+# Users With Expiry Date
+# ============================================================
 
-    Write-Error "Failed to retrieve users: $($_.Exception.Message)"
-    exit 1
-}
-
-$TotalUsers = @($Users).Count
-
-Write-Host "Total users retrieved: $TotalUsers" `
-    -ForegroundColor Green
-
-# ------------------------------------------------------------
-# Find Users With Expiry Dates
-# ------------------------------------------------------------
-
-$UsersWithExpiryDate = @(
+$UsersWithExpiry = @(
     $Users | Where-Object {
         $null -ne $_.EmployeeLeaveDateTime
     }
 )
 
 Write-Host ""
-Write-Host "Users with expiry date: $(@($UsersWithExpiryDate).Count)" `
-    -ForegroundColor Cyan
+Write-Host "Users with expiry date: $($UsersWithExpiry.Count)" -ForegroundColor White
 
-# ------------------------------------------------------------
-# Detect Expired Users
-# ------------------------------------------------------------
+# ============================================================
+# Find Expired Users
+# ============================================================
 
 $ExpiredUsers = @(
-    $UsersWithExpiryDate | Where-Object {
+    $UsersWithExpiry | Where-Object {
 
-        $LeaveDate = $_.EmployeeLeaveDateTime.Date
+        $LeaveDate = ([datetime]$_.EmployeeLeaveDateTime).Date
 
         $LeaveDate -lt $Today
     }
 )
 
-Write-Host "Expired users: $(@($ExpiredUsers).Count)" `
-    -ForegroundColor Yellow
+Write-Host "Expired users: $($ExpiredUsers.Count)" -ForegroundColor Yellow
 
-# ------------------------------------------------------------
-# Build Report
-# ------------------------------------------------------------
+# ============================================================
+# Build Results
+# ============================================================
 
-$Report = @(
-    $ExpiredUsers | ForEach-Object {
+$Results = foreach ($User in $ExpiredUsers) {
 
-        $LeaveDate = $_.EmployeeLeaveDateTime.Date
+    $LeaveDate = ([datetime]$User.EmployeeLeaveDateTime).Date
 
-        $DaysExpired = ($Today - $LeaveDate).Days
+    $DaysExpired = ($Today - $LeaveDate).Days
 
-        $ActionRequired = if ($_.AccountEnabled -eq $true) {
-            "Disable Account"
-        }
-        else {
-            "Already Disabled"
-        }
-
-        [PSCustomObject]@{
-            DisplayName          = $_.DisplayName
-            UserPrincipalName    = $_.UserPrincipalName
-            AccountEnabled       = $_.AccountEnabled
-            EmployeeLeaveDate    = $LeaveDate.ToString("yyyy-MM-dd")
-            DaysExpired          = $DaysExpired
-            ActionRequired       = $ActionRequired
-            UserId               = $_.Id
-        }
+    $ActionRequired = if ($User.AccountEnabled -eq $true) {
+        "Disable Account"
     }
-)
+    else {
+        "Already Disabled"
+    }
 
-# ------------------------------------------------------------
-# Display Results
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-Write-Host " Expired User Detection Results" `
-    -ForegroundColor Cyan
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-Write-Host ""
-
-if ($Report.Count -eq 0) {
-
-    Write-Host "No expired users found." -ForegroundColor Green
-    Write-Host ""
-    Write-Host "No accounts require action." -ForegroundColor Green
-
+    [PSCustomObject]@{
+        DisplayName          = $User.DisplayName
+        UserPrincipalName    = $User.UserPrincipalName
+        AccountEnabled       = $User.AccountEnabled
+        EmployeeLeaveDate    = $LeaveDate.ToString("yyyy-MM-dd")
+        DaysExpired          = $DaysExpired
+        ActionRequired       = $ActionRequired
+        UserId               = $User.Id
+    }
 }
-else {
 
-    Write-Host "Expired users found: $($Report.Count)" `
-        -ForegroundColor Red
+# ============================================================
+# Display Results
+# ============================================================
 
-    Write-Host ""
+Write-Section "Expired User Detection Results"
 
-    $Report |
+Write-Host "Expired users found: $($Results.Count)" -ForegroundColor Yellow
+Write-Host ""
+
+if ($Results.Count -gt 0) {
+
+    $Results |
         Select-Object `
             DisplayName,
             UserPrincipalName,
@@ -311,69 +304,128 @@ else {
             DaysExpired,
             ActionRequired |
         Format-Table -AutoSize
+}
+else {
 
-    # --------------------------------------------------------
-    # Export CSV Report
-    # --------------------------------------------------------
-
-    try {
-
-        $Report |
-            Export-Csv `
-                -Path $ReportFile `
-                -NoTypeInformation `
-                -Encoding UTF8 `
-                -Force
-
-        Write-Host ""
-        Write-Host "Report exported successfully:" `
-            -ForegroundColor Green
-
-        Write-Host $ReportFile -ForegroundColor White
-
-    }
-    catch {
-
-        Write-Error "Failed to export report: $($_.Exception.Message)"
-    }
+    Write-Host "No expired users found." -ForegroundColor Green
 }
 
-# ------------------------------------------------------------
-# Summary
-# ------------------------------------------------------------
+# ============================================================
+# Export Report
+# ============================================================
+#
+# IMPORTANT:
+# This script intentionally does NOT use ShouldProcess for
+# Export-Csv.
+#
+# Therefore -WhatIf from the parent orchestrator will NOT
+# prevent the detection report from being created.
+#
+# The CSV is only a local report and does not modify Entra ID.
+# ============================================================
 
-$ExpiredEnabledUsers = @(
-    $Report | Where-Object {
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$ReportPath = Join-Path `
+    $ReportsPath `
+    "ExpiredUsers_$Timestamp.csv"
+
+if ($Results.Count -gt 0) {
+
+    $Results |
+        Export-Csv `
+            -Path $ReportPath `
+            -NoTypeInformation `
+            -Encoding UTF8 `
+            -Force `
+            -ErrorAction Stop
+}
+else {
+
+    # Create an empty report with the expected headers
+    $EmptyReport = [PSCustomObject]@{
+        DisplayName       = ""
+        UserPrincipalName = ""
+        AccountEnabled    = ""
+        EmployeeLeaveDate = ""
+        DaysExpired       = ""
+        ActionRequired    = ""
+        UserId            = ""
+    }
+
+    $EmptyReport |
+        Select-Object `
+            DisplayName,
+            UserPrincipalName,
+            AccountEnabled,
+            EmployeeLeaveDate,
+            DaysExpired,
+            ActionRequired,
+            UserId |
+        Export-Csv `
+            -Path $ReportPath `
+            -NoTypeInformation `
+            -Encoding UTF8 `
+            -Force `
+            -ErrorAction Stop
+}
+
+# ============================================================
+# Verify Report Exists
+# ============================================================
+
+if (-not (Test-Path -Path $ReportPath)) {
+
+    throw "The expired-user report could not be created: $ReportPath"
+}
+
+$ReportFile = Get-Item -Path $ReportPath -ErrorAction Stop
+
+Write-Host ""
+Write-Host "Report exported successfully:" -ForegroundColor Green
+Write-Host $ReportFile.FullName -ForegroundColor White
+
+# ============================================================
+# Summary
+# ============================================================
+
+$ExpiredEnabled = @(
+    $Results | Where-Object {
         $_.AccountEnabled -eq $true
     }
 )
 
-$AlreadyDisabledUsers = @(
-    $Report | Where-Object {
+$ExpiredDisabled = @(
+    $Results | Where-Object {
         $_.AccountEnabled -eq $false
     }
 )
 
-Write-Host ""
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
-Write-Host " Summary" -ForegroundColor Cyan
-Write-Host "=============================================" `
-    -ForegroundColor Cyan
+Write-Section "Summary"
 
-Write-Host "Total users              : $TotalUsers"
-Write-Host "Users with expiry date   : $(@($UsersWithExpiryDate).Count)"
-Write-Host "Expired users            : $($Report.Count)"
-Write-Host "Expired + Enabled        : $($ExpiredEnabledUsers.Count)"
-Write-Host "Expired + Already Disabled: $($AlreadyDisabledUsers.Count)"
+Write-Host "Total users              : $($Users.Count)" -ForegroundColor White
+Write-Host "Users with expiry date   : $($UsersWithExpiry.Count)" -ForegroundColor White
+Write-Host "Expired users            : $($Results.Count)" -ForegroundColor Yellow
+Write-Host "Expired + Enabled        : $($ExpiredEnabled.Count)" -ForegroundColor Yellow
+Write-Host "Expired + Already Disabled: $($ExpiredDisabled.Count)" -ForegroundColor Gray
 
 Write-Host ""
-Write-Host "IMPORTANT: This script is READ-ONLY." `
-    -ForegroundColor Yellow
-
-Write-Host "No user accounts were modified." `
-    -ForegroundColor Yellow
-
+Write-Host "IMPORTANT: This script is READ-ONLY." -ForegroundColor Cyan
+Write-Host "No user accounts were modified." -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Script completed successfully." `
-    -ForegroundColor Green
+
+# ============================================================
+# Return Report Information to Orchestrator
+# ============================================================
+
+[PSCustomObject]@{
+    Status               = "Success"
+    TotalUsers           = $Users.Count
+    UsersWithExpiry      = $UsersWithExpiry.Count
+    ExpiredUsers         = $Results.Count
+    ExpiredEnabled       = $ExpiredEnabled.Count
+    ExpiredAlreadyDisabled = $ExpiredDisabled.Count
+    ReportPath           = $ReportFile.FullName
+}
+
+Write-Host "Script completed successfully." -ForegroundColor Green
